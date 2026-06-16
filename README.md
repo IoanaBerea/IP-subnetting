@@ -8,8 +8,20 @@ Run the CLI with an input file (one IPv4 per line) and an output file:
 python3 group_subnets.py sample_ips.txt output_subnets.txt
 ```
 
+**CSV mode** (group source IPs by destination):
+
+```bash
+python3 group_subnets.py --csv input.csv output_csv.txt
+```
+
+Input format (CSV mode):
+- **With headers**: CSV file with "Source address" and "Destination address" columns (case-insensitive). All other columns are ignored.
+- **Without headers**: Plain comma-separated `source_ip, destination_ip` per line (falls back to first two columns).
+- Groups source IPs by their destination
+
 Options
 
+- `--csv`: Enable CSV mode. Input format is `source_ip,destination_ip` per line. Groups source IPs by their destination.
 - `--coarse-first`: prefer larger subnets first (e.g., /23, /22) when grouping.
 - `--min-mask N`: the smallest mask length to consider (coarsest). For example
   `--min-mask 22` will allow grouping up to `/22` but not `/21` or larger.
@@ -29,10 +41,23 @@ python3 group_subnets.py --coarse-first --min-mask 22 sample_ips.txt output_coar
 
 Output format
 
+**Standard mode:**
 Each line in the output contains a subnet in CIDR form followed by the
 input IPs that were grouped into that subnet, e.g.:
 
+```
 192.168.0.0/30: 192.168.0.1, 192.168.0.2
+```
+
+**CSV mode:**
+For each destination IP, lists the grouped source subnets:
+
+```
+destination: 192.168.1.1
+  10.145.0.0/24: 10.145.0.9, 10.145.0.10, 10.145.0.50
+destination: 192.168.1.2
+  10.146.0.0/24: 10.146.0.9, 10.146.0.10, 10.146.0.75
+```
 
 Notes
 
