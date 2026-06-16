@@ -18,5 +18,5 @@ Steps:
 3. the remaining IPs will be /32
 
 Requirements:
-- groups must be at least /24 (/24, /23, /22, etc.)
+- groups must have the mask between /8 and /24
 - erase the previous lines from the output file before adding the current lines
