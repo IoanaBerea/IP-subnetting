@@ -179,14 +179,16 @@ def write_output_csv(path, grouped_by_dest):
         path: output file path
         grouped_by_dest: dict {dst_ip_int: [(prefix_int, prefix_len, [src_ips]), ...]}
     """
-    with open(path, 'w', encoding='utf-8') as f:
+    with open(path, 'w', encoding='utf-8', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Destination IP', 'Subnet', 'Source IPs'])
+        
         for dst_ip in sorted(grouped_by_dest.keys()):
             dst_str = int_to_ip(dst_ip)
-            f.write(f"destination: {dst_str}\n")
             for prefix, L, members in grouped_by_dest[dst_ip]:
                 subnet = f"{int_to_ip(prefix)}/{L}"
                 member_s = ', '.join(int_to_ip(m) for m in members)
-                f.write(f"  {subnet}: {member_s}\n")
+                writer.writerow([dst_str, subnet, member_s])
 
 
 def main():
