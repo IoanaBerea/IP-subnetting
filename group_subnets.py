@@ -76,23 +76,47 @@ def read_input(path, csv_mode=False):
     """Read IPs from input file.
     
     In csv_mode: return dict {dest_ip_int: [source_ip_ints]}
-      - Reads CSV with headers, extracts "Source address" and "Destination address" columns
+      - Reads CSV with headers, auto-detects delimiter (comma or semicolon)
+      - Looks for: src_ip, source_address, source address, source_ip
+      - Looks for: dest_ip, destination_address, destination address, destination_ip
       - Falls back to first two columns if headers not found
     Otherwise: return list of IP integers
     """
     if csv_mode:
         data = defaultdict(list)
         with open(path, 'r', encoding='utf-8') as f:
-            # Try to read as CSV with headers (DictReader)
-            reader = csv.DictReader(f)
+            # Read first line to detect delimiter
+            first_line = f.readline().strip()
+            if not first_line:
+                print("Warning: CSV file appears empty", file=sys.stderr)
+                return data
+            
+            # Detect delimiter
+            delimiter = ',' if ',' in first_line else ';'
+            
+            # Reset and parse with DictReader
+            f.seek(0)
+            reader = csv.DictReader(f, delimiter=delimiter)
             if reader.fieldnames is None or not reader.fieldnames:
                 print("Warning: CSV file appears empty", file=sys.stderr)
                 return data
             
             # Check for source/destination columns (case-insensitive)
-            fieldnames_lower = {fn.lower(): fn for fn in reader.fieldnames}
-            src_col = fieldnames_lower.get('source address') or fieldnames_lower.get('source ip') or None
-            dst_col = fieldnames_lower.get('destination address') or fieldnames_lower.get('destination ip') or None
+            fieldnames_lower = {fn.lower().replace(' ', '_').replace('-', '_'): fn for fn in reader.fieldnames}
+            
+            # Look for source column with multiple name variations
+            src_col = None
+            for candidate in ['src_ip', 'source_ip', 'source_address', 'source_addr', 'sourceip', 'sourceaddress']:
+                if candidate in fieldnames_lower:
+                    src_col = fieldnames_lower[candidate]
+                    break
+            
+            # Look for destination column with multiple name variations
+            dst_col = None
+            for candidate in ['dest_ip', 'destination_ip', 'destination_address', 'destination_addr', 'destip', 'destinationaddress']:
+                if candidate in fieldnames_lower:
+                    dst_col = fieldnames_lower[candidate]
+                    break
             
             if src_col and dst_col:
                 # Use header-based extraction
@@ -107,14 +131,14 @@ def read_input(path, csv_mode=False):
                     except Exception as e:
                         print(f"Skipping invalid row: {row} ({e})", file=sys.stderr)
             else:
-                # Fallback: assume first two columns are source, destination
-                print(f"No 'Source address' or 'Destination address' columns found. Using first two columns.", file=sys.stderr)
+                print(f"Columns found: {list(reader.fieldnames)}", file=sys.stderr)
+                print(f"No source/destination IP columns found. Using first two columns.", file=sys.stderr)
                 f.seek(0)
                 for line_num, ln in enumerate(f, 1):
                     s = ln.strip()
                     if not s:
                         continue
-                    parts = [p.strip() for p in s.split(',')]
+                    parts = [p.strip() for p in s.split(delimiter)]
                     if len(parts) < 2:
                         print(f"Skipping line {line_num} (need 2 fields): {s}", file=sys.stderr)
                         continue
