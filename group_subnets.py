@@ -30,44 +30,60 @@ def mask_for_len(L: int) -> int:
 
 
 def group_ips(ip_ints, min_mask=8, max_mask=24, coarse_first=False):
-    # Group by first octet (MSB) to avoid crossing MSB boundaries
+    # Backwards-compatible wrapper for metadata-free items
+    items = [(ip, set()) for ip in ip_ints]
+    grouped = group_ip_meta(items, min_mask=min_mask, max_mask=max_mask, coarse_first=coarse_first)
+    # Convert members from (ip, ports) to plain ip lists
+    results = []
+    for prefix, L, members in grouped:
+        ips = [m[0] for m in members]
+        results.append((prefix, L, ips))
+    return results
+
+
+def group_ip_meta(items, min_mask=8, max_mask=24, coarse_first=False):
+    """Group items where each item is (ip_int, ports_set).
+
+    Returns list of (prefix_int, prefix_len, [ (ip_int, ports_set), ... ])
+    """
+    # Group by first octet (MSB)
     by_octet = defaultdict(list)
-    for ip in ip_ints:
+    for ip, ports in items:
         octet = ip >> 24
-        by_octet[octet].append(ip)
+        by_octet[octet].append((ip, set(ports)))
 
-    results = []  # tuples (prefix_int, prefix_len, [ip_ints])
+    results = []
+    for octet, ip_items in by_octet.items():
+        remaining = {ip: ports for ip, ports in ip_items}
 
-    for octet, ips in by_octet.items():
-        remaining = set(ips)
-
-        # Determine mask iteration order based on coarse_first
         low = max(min_mask, 8)
         high = min(max_mask, 32)
         if coarse_first:
-            mask_range = range(low, high + 1)  # e.g., 8..24
+            mask_range = range(low, high + 1)
         else:
-            mask_range = range(high, low - 1, -1)  # e.g., 24..8
+            mask_range = range(high, low - 1, -1)
 
         for L in mask_range:
             mask = mask_for_len(L)
             groups = defaultdict(list)
-            for ip in list(remaining):
+            for ip in list(remaining.keys()):
                 prefix = ip & mask
                 groups[prefix].append(ip)
 
-            # Collect groups that have at least 2 addresses
             for prefix, members in groups.items():
                 if len(members) >= 2:
-                    results.append((prefix, L, sorted(members)))
+                    # collect member tuples
+                    mems = []
+                    for m in sorted(members):
+                        mems.append((m, remaining[m]))
+                    results.append((prefix, L, mems))
                     for m in members:
-                        remaining.discard(m)
+                        remaining.pop(m, None)
 
         # Remaining singletons -> /32
-        for ip in sorted(remaining):
-            results.append((ip, 32, [ip]))
+        for ip in sorted(remaining.keys()):
+            results.append((ip, 32, [(ip, remaining[ip])]))
 
-    # Sort results by numeric prefix then mask length (more specific first)
     results.sort(key=lambda x: (x[0], -x[1]))
     return results
 
@@ -83,13 +99,13 @@ def read_input(path, csv_mode=False):
     Otherwise: return list of IP integers
     """
     if csv_mode:
-        data = defaultdict(list)
+        records = []
         with open(path, 'r', encoding='utf-8') as f:
             # Read first line to detect delimiter
             first_line = f.readline().strip()
             if not first_line:
                 print("Warning: CSV file appears empty", file=sys.stderr)
-                return data
+                return records
             
             # Detect delimiter
             delimiter = ',' if ',' in first_line else ';'
@@ -99,7 +115,7 @@ def read_input(path, csv_mode=False):
             reader = csv.DictReader(f, delimiter=delimiter)
             if reader.fieldnames is None or not reader.fieldnames:
                 print("Warning: CSV file appears empty", file=sys.stderr)
-                return data
+                return records
             
             # Check for source/destination columns (case-insensitive)
             fieldnames_lower = {fn.lower().replace(' ', '_').replace('-', '_'): fn for fn in reader.fieldnames}
@@ -118,16 +134,25 @@ def read_input(path, csv_mode=False):
                     dst_col = fieldnames_lower[candidate]
                     break
             
+            # Also look for port columns
+            port_col = None
+            for candidate in ['dest_port', 'destination_port', 'dport', 'destport', 'port']:
+                if candidate in fieldnames_lower:
+                    port_col = fieldnames_lower[candidate]
+                    break
+
             if src_col and dst_col:
                 # Use header-based extraction
                 for row in reader:
                     try:
                         src_str = row.get(src_col, '').strip()
                         dst_str = row.get(dst_col, '').strip()
+                        port_str = row.get(port_col, '').strip() if port_col else ''
                         if src_str and dst_str:
                             src_ip = ip_to_int(src_str)
                             dst_ip = ip_to_int(dst_str)
-                            data[dst_ip].append(src_ip)
+                            dst_port = port_str if port_str else None
+                            records.append((src_ip, dst_ip, None, dst_port))
                     except Exception as e:
                         print(f"Skipping invalid row: {row} ({e})", file=sys.stderr)
             else:
@@ -145,10 +170,11 @@ def read_input(path, csv_mode=False):
                     try:
                         src_ip = ip_to_int(parts[0])
                         dst_ip = ip_to_int(parts[1])
-                        data[dst_ip].append(src_ip)
+                        dst_port = parts[2] if len(parts) > 2 else None
+                        records.append((src_ip, dst_ip, None, dst_port))
                     except Exception as e:
                         print(f"Skipping line {line_num}: {s} ({e})", file=sys.stderr)
-        return data
+        return records
     else:
         ips = []
         with open(path, 'r', encoding='utf-8') as f:
@@ -173,22 +199,46 @@ def write_output(path, groups):
 
 
 def write_output_csv(path, grouped_by_dest):
-    """Write CSV output: for each destination, list grouped source subnets.
-    
-    Args:
-        path: output file path
-        grouped_by_dest: dict {dst_ip_int: [(prefix_int, prefix_len, [src_ips]), ...]}
+    """Write CSV output: for each destination, list grouped source subnets and ports.
+
+    Columns: Destination IP, Subnet, Source IPs, Ports
     """
     with open(path, 'w', encoding='utf-8', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['Destination IP', 'Subnet', 'Source IPs'])
-        
+        writer.writerow(['Destination IP', 'Subnet', 'Source IPs', 'Ports'])
+
         for dst_ip in sorted(grouped_by_dest.keys()):
             dst_str = int_to_ip(dst_ip)
             for prefix, L, members in grouped_by_dest[dst_ip]:
                 subnet = f"{int_to_ip(prefix)}/{L}"
-                member_s = ', '.join(int_to_ip(m) for m in members)
-                writer.writerow([dst_str, subnet, member_s])
+                # members are list of (ip_int, ports_set)
+                ips = [int_to_ip(m[0]) for m in members]
+                ports_list = []
+                for m in members:
+                    ports = sorted([p for p in m[1]]) if m[1] else []
+                    ports_list.append(','.join(ports) if ports else '')
+                member_s = '; '.join(ips)
+                ports_s = '; '.join(ports_list)
+                writer.writerow([dst_str, subnet, member_s, ports_s])
+
+
+def write_output_csv_by_source(path, grouped_by_src):
+    """Write CSV output grouped by source IP: Source IP, Subnet, Destination IPs, Ports"""
+    with open(path, 'w', encoding='utf-8', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Source IP', 'Subnet', 'Destination IPs', 'Ports'])
+        for src_ip in sorted(grouped_by_src.keys()):
+            src_str = int_to_ip(src_ip)
+            for prefix, L, members in grouped_by_src[src_ip]:
+                subnet = f"{int_to_ip(prefix)}/{L}"
+                dsts = [int_to_ip(m[0]) for m in members]
+                ports_list = []
+                for m in members:
+                    ports = sorted([p for p in m[1]]) if m[1] else []
+                    ports_list.append(','.join(ports) if ports else '')
+                dst_s = '; '.join(dsts)
+                ports_s = '; '.join(ports_list)
+                writer.writerow([src_str, subnet, dst_s, ports_s])
 
 
 def main():
@@ -202,21 +252,51 @@ def main():
     args = ap.parse_args()
 
     if args.csv:
-        # CSV mode: group source IPs by destination
-        csv_data = read_input(args.input, csv_mode=True)
-        if not csv_data:
+        # CSV mode: read records (src_ip, dst_ip, src_port, dst_port)
+        records = read_input(args.input, csv_mode=True)
+        if not records:
             print("No valid CSV entries found in input.", file=sys.stderr)
             return 1
 
-        # Group source IPs for each destination
+        # Build destination -> src_ip -> set(dst_ports)
+        dest_map = defaultdict(lambda: defaultdict(set))
+        # Build source -> dest_ip -> set(dest_ports)
+        src_map = defaultdict(lambda: defaultdict(set))
+        for src_ip, dst_ip, _, dst_port in records:
+            if dst_port:
+                dest_map[dst_ip][src_ip].add(dst_port)
+                src_map[src_ip][dst_ip].add(dst_port)
+            else:
+                dest_map[dst_ip][src_ip]
+                src_map[src_ip][dst_ip]
+
+        # For each destination, prepare items list (src_ip, ports_set) and group
         grouped_by_dest = {}
-        for dst_ip, src_ips in csv_data.items():
-            groups = group_ips(src_ips, min_mask=args.min_mask, max_mask=args.max_mask, coarse_first=args.coarse_first)
+        for dst_ip, srcs in dest_map.items():
+            items = [(sip, set(sorted(list(ports)))) for sip, ports in srcs.items()]
+            groups = group_ip_meta(items, min_mask=args.min_mask, max_mask=args.max_mask, coarse_first=args.coarse_first)
             grouped_by_dest[dst_ip] = groups
 
+        # For each source, prepare items list (dst_ip, ports_set) and group into subnets
+        grouped_by_src = {}
+        for src_ip, dsts in src_map.items():
+            items = [(dip, set(sorted(list(ports)))) for dip, ports in dsts.items()]
+            groups = group_ip_meta(items, min_mask=args.min_mask, max_mask=args.max_mask, coarse_first=args.coarse_first)
+            grouped_by_src[src_ip] = groups
+
+        # Write destination-grouped CSV (includes Source IPs and their ports)
         write_output_csv(args.output, grouped_by_dest)
+        # Write source-grouped CSV next to output (append _by_source)
+        out_by_src = args.output
+        if out_by_src.endswith('.csv'):
+            out_by_src = out_by_src[:-4] + '_by_source.csv'
+        else:
+            out_by_src = out_by_src + '_by_source.csv'
+        write_output_csv_by_source(out_by_src, grouped_by_src)
+
         total_groups = sum(len(g) for g in grouped_by_dest.values())
         print(f"Wrote {total_groups} subnets grouped by {len(grouped_by_dest)} destinations to {args.output}")
+        print(f"Wrote source-grouped CSV to {out_by_src}")
     else:
         # Original mode: group all IPs
         ips = read_input(args.input, csv_mode=False)
