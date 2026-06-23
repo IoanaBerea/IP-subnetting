@@ -42,15 +42,16 @@ def group_ips(ip_ints, min_mask=8, max_mask=24, coarse_first=False):
 
 
 def group_ip_meta(items, min_mask=8, max_mask=24, coarse_first=False):
-    """Group items where each item is (ip_int, ports_set).
+    """Group items where each item is (ip_int, metadata).
 
-    Returns list of (prefix_int, prefix_len, [ (ip_int, ports_set), ... ])
+    Returns list of (prefix_int, prefix_len, [ (ip_int, metadata), ... ])
     """
     # Group by first octet (MSB)
     by_octet = defaultdict(list)
-    for ip, ports in items:
+    for ip, metadata in items:
         octet = ip >> 24
-        by_octet[octet].append((ip, set(ports)))
+        copied_meta = metadata.copy() if hasattr(metadata, 'copy') else metadata
+        by_octet[octet].append((ip, copied_meta))
 
     results = []
     for octet, ip_items in by_octet.items():
@@ -141,6 +142,13 @@ def read_input(path, csv_mode=False):
                     port_col = fieldnames_lower[candidate]
                     break
 
+            # Look for application/service columns
+            app_col = None
+            for candidate in ['application', 'app', 'service', 'protocol']:
+                if candidate in fieldnames_lower:
+                    app_col = fieldnames_lower[candidate]
+                    break
+
             if src_col and dst_col:
                 # Use header-based extraction
                 for row in reader:
@@ -148,11 +156,13 @@ def read_input(path, csv_mode=False):
                         src_str = row.get(src_col, '').strip()
                         dst_str = row.get(dst_col, '').strip()
                         port_str = row.get(port_col, '').strip() if port_col else ''
+                        app_str = row.get(app_col, '').strip() if app_col else ''
                         if src_str and dst_str:
                             src_ip = ip_to_int(src_str)
                             dst_ip = ip_to_int(dst_str)
                             dst_port = port_str if port_str else None
-                            records.append((src_ip, dst_ip, None, dst_port))
+                            application = app_str if app_str else None
+                            records.append((src_ip, dst_ip, dst_port, application))
                     except Exception as e:
                         print(f"Skipping invalid row: {row} ({e})", file=sys.stderr)
             else:
@@ -171,7 +181,8 @@ def read_input(path, csv_mode=False):
                         src_ip = ip_to_int(parts[0])
                         dst_ip = ip_to_int(parts[1])
                         dst_port = parts[2] if len(parts) > 2 else None
-                        records.append((src_ip, dst_ip, None, dst_port))
+                        application = parts[3] if len(parts) > 3 else None
+                        records.append((src_ip, dst_ip, dst_port, application))
                     except Exception as e:
                         print(f"Skipping line {line_num}: {s} ({e})", file=sys.stderr)
         return records
@@ -222,23 +233,37 @@ def write_output_csv(path, grouped_by_dest):
                 writer.writerow([dst_str, subnet, member_s, ports_s])
 
 
-def write_output_csv_by_source(path, grouped_by_src):
-    """Write CSV output grouped by source IP: Source IP, Subnet, Destination IPs, Ports"""
+def write_output_csv_by_source(path, grouped_by_src24, source_ips_by_src24):
+    """Write CSV output grouped by source /24 subnet.
+
+    Each row is a source /24, with all destination subnets for that /24 on one line.
+    """
     with open(path, 'w', encoding='utf-8', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['Source IP', 'Subnet', 'Destination IPs', 'Ports'])
-        for src_ip in sorted(grouped_by_src.keys()):
-            src_str = int_to_ip(src_ip)
-            for prefix, L, members in grouped_by_src[src_ip]:
+        writer.writerow(['Source /24', 'Source IPs', 'Destination Subnets', 'Destination IPs', 'Ports', 'Applications'])
+        for src24 in sorted(grouped_by_src24.keys()):
+            src24_str = f"{int_to_ip(src24)}/24"
+            source_ips = sorted(int_to_ip(ip) for ip in source_ips_by_src24[src24])
+            source_ips_s = '; '.join(source_ips)
+
+            subnet_entries = []
+            dest_ips = []
+            port_set = set()
+            app_set = set()
+            for prefix, L, members in grouped_by_src24[src24]:
                 subnet = f"{int_to_ip(prefix)}/{L}"
-                dsts = [int_to_ip(m[0]) for m in members]
-                ports_list = []
+                subnet_entries.append(subnet)
                 for m in members:
-                    ports = sorted([p for p in m[1]]) if m[1] else []
-                    ports_list.append(','.join(ports) if ports else '')
-                dst_s = '; '.join(dsts)
-                ports_s = '; '.join(ports_list)
-                writer.writerow([src_str, subnet, dst_s, ports_s])
+                    dest_ips.append(int_to_ip(m[0]))
+                    if isinstance(m[1], dict):
+                        port_set.update(m[1].get('ports', set()))
+                        app_set.update(m[1].get('apps', set()))
+
+            subnet_s = '; '.join(subnet_entries)
+            dest_ips_s = '; '.join(sorted(dest_ips, key=lambda ip: tuple(int(x) for x in ip.split('.'))))
+            ports_s = '; '.join(sorted(port_set, key=lambda p: (int(p) if p.isdigit() else p)))
+            apps_s = '; '.join(sorted(app_set))
+            writer.writerow([src24_str, source_ips_s, subnet_s, dest_ips_s, ports_s, apps_s])
 
 
 def main():
@@ -258,45 +283,28 @@ def main():
             print("No valid CSV entries found in input.", file=sys.stderr)
             return 1
 
-        # Build destination -> src_ip -> set(dst_ports)
-        dest_map = defaultdict(lambda: defaultdict(set))
-        # Build source -> dest_ip -> set(dest_ports)
-        src_map = defaultdict(lambda: defaultdict(set))
-        for src_ip, dst_ip, _, dst_port in records:
+        # Build source /24 -> dest_ip -> metadata (ports + applications)
+        src24_map = defaultdict(lambda: defaultdict(lambda: {'ports': set(), 'apps': set()}))
+        source_ips_by_src24 = defaultdict(set)
+        for src_ip, dst_ip, dst_port, application in records:
+            src24 = src_ip & mask_for_len(24)
+            source_ips_by_src24[src24].add(src_ip)
             if dst_port:
-                dest_map[dst_ip][src_ip].add(dst_port)
-                src_map[src_ip][dst_ip].add(dst_port)
-            else:
-                dest_map[dst_ip][src_ip]
-                src_map[src_ip][dst_ip]
+                src24_map[src24][dst_ip]['ports'].add(dst_port)
+            if application:
+                src24_map[src24][dst_ip]['apps'].add(application)
 
-        # For each destination, prepare items list (src_ip, ports_set) and group
-        grouped_by_dest = {}
-        for dst_ip, srcs in dest_map.items():
-            items = [(sip, set(sorted(list(ports)))) for sip, ports in srcs.items()]
+        # For each source /24, prepare dest items list and group into subnets
+        grouped_by_src24 = {}
+        for src24, dsts in src24_map.items():
+            items = [(dip, {'ports': set(sorted(list(metadata['ports']))), 'apps': set(sorted(list(metadata['apps'])))}) for dip, metadata in dsts.items()]
             groups = group_ip_meta(items, min_mask=args.min_mask, max_mask=args.max_mask, coarse_first=args.coarse_first)
-            grouped_by_dest[dst_ip] = groups
+            grouped_by_src24[src24] = groups
 
-        # For each source, prepare items list (dst_ip, ports_set) and group into subnets
-        grouped_by_src = {}
-        for src_ip, dsts in src_map.items():
-            items = [(dip, set(sorted(list(ports)))) for dip, ports in dsts.items()]
-            groups = group_ip_meta(items, min_mask=args.min_mask, max_mask=args.max_mask, coarse_first=args.coarse_first)
-            grouped_by_src[src_ip] = groups
-
-        # Write destination-grouped CSV (includes Source IPs and their ports)
-        write_output_csv(args.output, grouped_by_dest)
-        # Write source-grouped CSV next to output (append _by_source)
-        out_by_src = args.output
-        if out_by_src.endswith('.csv'):
-            out_by_src = out_by_src[:-4] + '_by_source.csv'
-        else:
-            out_by_src = out_by_src + '_by_source.csv'
-        write_output_csv_by_source(out_by_src, grouped_by_src)
-
-        total_groups = sum(len(g) for g in grouped_by_dest.values())
-        print(f"Wrote {total_groups} subnets grouped by {len(grouped_by_dest)} destinations to {args.output}")
-        print(f"Wrote source-grouped CSV to {out_by_src}")
+        # Write source /24-grouped CSV only
+        write_output_csv_by_source(args.output, grouped_by_src24, source_ips_by_src24)
+        total_groups = sum(len(g) for g in grouped_by_src24.values())
+        print(f"Wrote {total_groups} subnets grouped by {len(grouped_by_src24)} source /24 subnets to {args.output}")
     else:
         # Original mode: group all IPs
         ips = read_input(args.input, csv_mode=False)
